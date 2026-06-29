@@ -918,6 +918,10 @@ def export_pdf(summary, conclusion, exceptions, exception_summary):
 
 
 def build_exception_summary(df):
+    """
+    Build summarized counts of each exception type for dashboard charts and reporting.
+    Always returns exactly two columns: Exception Type and Count.
+    """
     if "Exception Flags" not in df.columns:
         return pd.DataFrame(columns=["Exception Type", "Count"])
 
@@ -932,13 +936,12 @@ def build_exception_summary(df):
     if not flags:
         return pd.DataFrame(columns=["Exception Type", "Count"])
 
-    return (
-        pd.Series(flags)
-        .value_counts()
-        .reset_index()
-        .rename(columns={"index": "Exception Type", 0: "Count"})
-    )
+    summary = pd.Series(flags).value_counts().reset_index()
+    summary.columns = ["Exception Type", "Count"]
+    summary["Count"] = pd.to_numeric(summary["Count"], errors="coerce").fillna(0).astype(int)
+    summary = summary.sort_values("Count", ascending=False).reset_index(drop=True)
 
+    return summary
 
 # ============================================================
 # Sidebar
@@ -1148,25 +1151,41 @@ st.write(conclusion)
 
 st.subheader("Exception Summary")
 
-if exception_summary.empty:
+if exception_summary is None or exception_summary.empty:
     st.success("No exceptions were identified.")
 else:
+    exception_summary = exception_summary.copy()
+
+    # Guarantee expected column names for Plotly
+    if len(exception_summary.columns) >= 2:
+        exception_summary = exception_summary.iloc[:, :2]
+        exception_summary.columns = ["Exception Type", "Count"]
+    else:
+        exception_summary = pd.DataFrame(columns=["Exception Type", "Count"])
+
+    exception_summary["Count"] = pd.to_numeric(
+        exception_summary["Count"],
+        errors="coerce"
+    ).fillna(0).astype(int)
+
     c1, c2 = st.columns([1, 2])
 
     with c1:
         st.dataframe(exception_summary, use_container_width=True)
 
     with c2:
-        fig = px.bar(
-            exception_summary,
-            x="Count",
-            y="Exception Type",
-            orientation="h",
-            title="Exception Counts by Type",
-        )
-        fig.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig, use_container_width=True)
-
+        if exception_summary.empty:
+            st.info("No exception chart available.")
+        else:
+            fig = px.bar(
+                exception_summary,
+                x="Count",
+                y="Exception Type",
+                orientation="h",
+                title="Exception Counts by Type",
+            )
+            fig.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig, use_container_width=True)
 
 # ============================================================
 # Charts
