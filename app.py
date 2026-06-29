@@ -158,6 +158,9 @@ def extract_lookup_from_sheet(df, sheet_name):
                 }
             )
 
+    if not records:
+        return pd.DataFrame(columns=["Code", "Description", "Source Tab"])
+
     return pd.DataFrame(records).drop_duplicates()
 
 
@@ -387,10 +390,96 @@ def detect_description_col(df):
     )
 
 
-def add_exceptions(df, large_threshold):
+def append_flag(existing, new_flag):
+    existing = "" if pd.isna(existing) else str(existing).strip()
+    if existing == "":
+        return new_flag
+    if new_flag in existing:
+        return existing
+    return existing + "; " + new_flag
+
+
+def add_exceptions(
+    df,
+    large_threshold,
+    round_amount_threshold=10000,
+    after_hours_start=20,
+    after_hours_end=6,
+    dormant_days=180,
+):
     df = df.copy()
 
     desc_col = detect_description_col(df)
+
+    inputter_col = find_col(
+        df,
+        [
+            "inputter",
+            "entered by",
+            "created by",
+            "prepared by",
+            "journal creator",
+            "user name",
+            "created user",
+            "creator",
+        ],
+    )
+
+    approver_col = find_col(
+        df,
+        [
+            "approver",
+            "approved by",
+            "authorized by",
+            "authorizer",
+            "journal approver",
+            "approval user",
+            "approved user",
+        ],
+    )
+
+    batch_col = find_col(
+        df,
+        [
+            "batch id",
+            "batch number",
+            "batch name",
+            "journal batch",
+            "batch",
+            "journal batch name",
+        ],
+    )
+
+    source_col = find_col(df, ["journal source", "source", "transaction source"])
+    category_col = find_col(df, ["journal category", "category"])
+
+    invoice_col = find_col(
+        df,
+        [
+            "invoice number",
+            "invoice num",
+            "invoice",
+            "voucher number",
+            "voucher",
+            "supplier invoice",
+        ],
+    )
+
+    budget_col = find_col(
+        df,
+        ["budget", "budget amount", "approved budget", "original budget", "current budget"],
+    )
+
+    actual_col = find_col(
+        df,
+        ["actual", "actual amount", "expenditure", "expense amount", "ytd actual"],
+    )
+
+    available_budget_col = find_col(
+        df,
+        ["available budget", "remaining budget", "budget remaining", "funds available"],
+    )
+
     segment_cols = ["Fund", "Business Function", "Cost Center", "Account", "Program"]
 
     flags = []
@@ -398,37 +487,126 @@ def add_exceptions(df, large_threshold):
     for _, row in df.iterrows():
         row_flags = []
 
+        # Missing COA segment
         for col in segment_cols:
             if col in df.columns and str(row.get(col, "")).strip() == "":
                 row_flags.append(f"Missing {col}")
 
+        # Unknown COA code
         for col in segment_cols:
             desc_col_segment = f"{col} Description"
-
             if desc_col_segment in df.columns:
                 if str(row.get(col, "")).strip() != "" and pd.isna(row.get(desc_col_segment)):
                     row_flags.append(f"Unknown {col} code")
 
+        # Missing description
         if desc_col and str(row.get(desc_col, "")).strip() in ["", "nan", "None"]:
             row_flags.append("Missing transaction description")
 
+        # Zero amount
         if abs(row.get("Net Amount", 0)) == 0:
             row_flags.append("Zero amount transaction")
 
+        # Large transaction
         if abs(row.get("Net Amount", 0)) >= large_threshold:
             row_flags.append("Large transaction")
 
         tx_date = row.get("Transaction Date")
 
+        # Future-dated transaction
         if pd.notna(tx_date) and tx_date.date() > datetime.today().date():
             row_flags.append("Future-dated transaction")
 
+        # Weekend posting
         if pd.notna(tx_date) and tx_date.weekday() >= 5:
             row_flags.append("Weekend posting")
+
+        # After-hours posting
+        if pd.notna(tx_date):
+            hour = tx_date.hour
+            if hour >= after_hours_start or hour < after_hours_end:
+                row_flags.append("After-hours posting")
+
+        # Manual journal entry
+        source_value = str(row.get(source_col, "")).lower() if source_col else ""
+        category_value = str(row.get(category_col, "")).lower() if category_col else ""
+
+        if "manual" in source_value or "manual" in category_value:
+            row_flags.append("Manual journal entry")
+
+        # Suspicious round-dollar amount
+        amount = abs(row.get("Net Amount", 0))
+        if amount >= round_amount_threshold and amount % 1000 == 0:
+            row_flags.append("Suspicious round-dollar amount")
+
+        # Budget overrun
+        if available_budget_col:
+            available_budget = pd.to_numeric(row.get(available_budget_col), errors="coerce")
+            if pd.notna(available_budget) and available_budget < 0:
+                row_flags.append("Budget overrun")
+
+        elif budget_col and actual_col:
+            budget = pd.to_numeric(row.get(budget_col), errors="coerce")
+            actual = pd.to_numeric(row.get(actual_col), errors="coerce")
+            if pd.notna(budget) and pd.notna(actual) and actual > budget:
+                row_flags.append("Budget overrun")
+
+        # Segregation of duties issue
+        if inputter_col and approver_col:
+            inputter = str(row.get(inputter_col, "")).strip().lower()
+            approver = str(row.get(approver_col, "")).strip().lower()
+
+            if inputter and approver and inputter not in ["nan", "none"] and inputter == approver:
+                row_flags.append("Segregation of duties issue: inputter also approved")
 
         flags.append("; ".join(row_flags))
 
     df["Exception Flags"] = flags
+
+    # Duplicate invoice number
+    if invoice_col and "Net Amount" in df.columns:
+        duplicate_invoice_mask = df.duplicated(subset=[invoice_col, "Net Amount"], keep=False)
+        df.loc[duplicate_invoice_mask, "Exception Flags"] = df.loc[
+            duplicate_invoice_mask, "Exception Flags"
+        ].apply(lambda x: append_flag(x, "Duplicate invoice number"))
+
+    # Dormant account activity
+    if "Account" in df.columns and df["Transaction Date"].notna().any():
+        sorted_df = df.sort_values(["Account", "Transaction Date"]).copy()
+        sorted_df["Previous Account Date"] = sorted_df.groupby("Account")["Transaction Date"].shift(1)
+        sorted_df["Days Since Previous Activity"] = (
+            sorted_df["Transaction Date"] - sorted_df["Previous Account Date"]
+        ).dt.days
+
+        dormant_indices = sorted_df.index[sorted_df["Days Since Previous Activity"] >= dormant_days]
+
+        df.loc[dormant_indices, "Exception Flags"] = df.loc[dormant_indices, "Exception Flags"].apply(
+            lambda x: append_flag(x, "Dormant account activity")
+        )
+
+    # Non-sequential batch IDs
+    if batch_col:
+        temp = df[[batch_col]].copy()
+        temp["Batch Numeric"] = temp[batch_col].astype(str).str.extract(r"(\d+)$")
+        temp["Batch Numeric"] = pd.to_numeric(temp["Batch Numeric"], errors="coerce")
+
+        batch_numbers = sorted(temp["Batch Numeric"].dropna().unique())
+
+        missing_batches = []
+        if len(batch_numbers) > 1:
+            expected = set(range(int(min(batch_numbers)), int(max(batch_numbers)) + 1))
+            actual = set(int(x) for x in batch_numbers)
+            missing_batches = sorted(expected - actual)
+
+        if missing_batches:
+            df.loc[df[batch_col].notna(), "Exception Flags"] = df.loc[
+                df[batch_col].notna(), "Exception Flags"
+            ].apply(lambda x: append_flag(x, "Batch ID sequence gap detected"))
+
+            df["Missing Batch IDs"] = ", ".join(str(x) for x in missing_batches[:50])
+        else:
+            df["Missing Batch IDs"] = ""
+
     df["Has Exception"] = df["Exception Flags"].apply(lambda x: bool(str(x).strip()))
 
     return df
@@ -458,10 +636,9 @@ def add_duplicate_flags(df):
     else:
         df["Potential Duplicate"] = False
 
-    df.loc[df["Potential Duplicate"], "Exception Flags"] = (
-        df.loc[df["Potential Duplicate"], "Exception Flags"].astype(str)
-        + "; Potential duplicate"
-    ).str.strip("; ")
+    df.loc[df["Potential Duplicate"], "Exception Flags"] = df.loc[
+        df["Potential Duplicate"], "Exception Flags"
+    ].apply(lambda x: append_flag(x, "Potential duplicate"))
 
     df["Has Exception"] = df["Exception Flags"].apply(lambda x: bool(str(x).strip()))
 
@@ -471,7 +648,7 @@ def add_duplicate_flags(df):
 def create_summary(df):
     rows = len(df)
     exception_count = int(df["Has Exception"].sum())
-    duplicate_count = int(df["Potential Duplicate"].sum())
+    duplicate_count = int(df["Potential Duplicate"].sum()) if "Potential Duplicate" in df.columns else 0
 
     return {
         "Total Rows": rows,
@@ -517,28 +694,43 @@ def generate_conclusion(summary, top_dept, top_account):
 
     text.append(
         "Recommended next steps: review large transactions, unknown COA codes, duplicate flags, "
-        "future-dated postings, weekend postings, and transactions with missing descriptions."
+        "future-dated postings, weekend postings, after-hours postings, manual journals, budget overruns, "
+        "round-dollar transactions, dormant account activity, segregation of duties issues, duplicate invoices, "
+        "and batch sequence gaps."
     )
 
     return "\n\n".join(text)
 
 
-def export_excel(df, summary, conclusion):
+def export_excel(df, summary, conclusion, exception_summary):
     output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, sheet_name="Decoded Transactions", index=False)
         df[df["Has Exception"]].to_excel(writer, sheet_name="Exceptions", index=False)
         pd.DataFrame([summary]).to_excel(writer, sheet_name="Summary KPIs", index=False)
+        exception_summary.to_excel(writer, sheet_name="Exception Summary", index=False)
         pd.DataFrame({"Conclusion": [conclusion]}).to_excel(
             writer, sheet_name="Conclusion", index=False
         )
+
+        workbook = writer.book
+        header_fmt = workbook.add_format({"bold": True, "bg_color": "#D9EAF7"})
+        money_fmt = workbook.add_format({"num_format": "$#,##0.00"})
+        pct_fmt = workbook.add_format({"num_format": "0.0%"})
+
+        for sheet_name, worksheet in writer.sheets.items():
+            worksheet.set_row(0, None, header_fmt)
+            worksheet.set_column(0, 40, 18)
+
+        writer.sheets["Summary KPIs"].set_column(1, 5, 18, money_fmt)
+        writer.sheets["Summary KPIs"].set_column(7, 7, 12, pct_fmt)
 
     output.seek(0)
     return output
 
 
-def export_word(summary, conclusion, exceptions):
+def export_word(summary, conclusion, exceptions, exception_summary):
     output = io.BytesIO()
 
     doc = Document()
@@ -563,6 +755,21 @@ def export_word(summary, conclusion, exceptions):
             row[1].text = f"{v:.1%}" if "Rate" in k else f"{v:,.2f}"
         else:
             row[1].text = f"{v:,}" if isinstance(v, int) else str(v)
+
+    doc.add_heading("Exception Summary", level=1)
+
+    if exception_summary.empty:
+        doc.add_paragraph("No exceptions were identified.")
+    else:
+        table = doc.add_table(rows=1, cols=2)
+        table.style = "Table Grid"
+        table.rows[0].cells[0].text = "Exception Type"
+        table.rows[0].cells[1].text = "Count"
+
+        for _, r in exception_summary.iterrows():
+            row = table.add_row().cells
+            row[0].text = str(r["Exception Type"])
+            row[1].text = str(r["Count"])
 
     doc.add_heading("Exception Preview", level=1)
 
@@ -589,7 +796,7 @@ def export_word(summary, conclusion, exceptions):
     return output
 
 
-def export_pdf(summary, conclusion, exceptions):
+def export_pdf(summary, conclusion, exceptions, exception_summary):
     output = io.BytesIO()
 
     doc = SimpleDocTemplate(
@@ -645,6 +852,26 @@ def export_pdf(summary, conclusion, exceptions):
     )
 
     story.append(table)
+    story.append(Spacer(1, 14))
+
+    story.append(Paragraph("Exception Summary", styles["Heading1"]))
+
+    if exception_summary.empty:
+        story.append(Paragraph("No exceptions were identified.", styles["Normal"]))
+    else:
+        exception_data = [["Exception Type", "Count"]] + exception_summary.astype(str).values.tolist()
+        exception_table = Table(exception_data, colWidths=[300, 100])
+        exception_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightblue),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ]
+            )
+        )
+        story.append(exception_table)
+
     story.append(PageBreak())
     story.append(Paragraph("Exception Preview", styles["Heading1"]))
 
@@ -689,6 +916,29 @@ def export_pdf(summary, conclusion, exceptions):
     return output
 
 
+def build_exception_summary(df):
+    if "Exception Flags" not in df.columns:
+        return pd.DataFrame(columns=["Exception Type", "Count"])
+
+    flags = []
+
+    for value in df["Exception Flags"].dropna():
+        for flag in str(value).split(";"):
+            flag = flag.strip()
+            if flag:
+                flags.append(flag)
+
+    if not flags:
+        return pd.DataFrame(columns=["Exception Type", "Count"])
+
+    return (
+        pd.Series(flags)
+        .value_counts()
+        .reset_index()
+        .rename(columns={"index": "Exception Type", 0: "Count"})
+    )
+
+
 # ============================================================
 # Sidebar
 # ============================================================
@@ -723,6 +973,36 @@ large_threshold = st.sidebar.number_input(
 
 show_only_exceptions = st.sidebar.checkbox("Show only exceptions", value=False)
 
+st.sidebar.header("3. Advanced Audit Settings")
+
+round_amount_threshold = st.sidebar.number_input(
+    "Round-dollar threshold",
+    min_value=0,
+    value=10000,
+    step=1000,
+)
+
+after_hours_start = st.sidebar.number_input(
+    "After-hours start hour",
+    min_value=0,
+    max_value=23,
+    value=20,
+)
+
+after_hours_end = st.sidebar.number_input(
+    "After-hours end hour",
+    min_value=0,
+    max_value=23,
+    value=6,
+)
+
+dormant_days = st.sidebar.number_input(
+    "Dormant account inactivity days",
+    min_value=30,
+    value=180,
+    step=30,
+)
+
 
 # ============================================================
 # Landing Page
@@ -743,7 +1023,12 @@ if oracle_file is None or coa_file is None:
         - Debit and Credit, or Amount
         - Journal Source
         - Journal Category
-        - Vendor, Invoice Number, Batch Name, or Journal Name if available
+        - Vendor / Supplier
+        - Invoice Number
+        - Batch ID / Batch Number / Batch Name
+        - Inputter / Created By / Entered By / Prepared By
+        - Approver / Approved By / Authorized By
+        - Budget / Actual / Available Budget, if budget-overrun testing is needed
         """
     )
 
@@ -770,10 +1055,21 @@ with st.spinner("Reading files and building dashboard..."):
     df = detect_date_col(df)
     df = detect_amount_columns(df)
     df = add_coa_descriptions(df, lookups)
-    df = add_exceptions(df, large_threshold)
+
+    df = add_exceptions(
+        df,
+        large_threshold=large_threshold,
+        round_amount_threshold=round_amount_threshold,
+        after_hours_start=after_hours_start,
+        after_hours_end=after_hours_end,
+        dormant_days=dormant_days,
+    )
+
     df = add_duplicate_flags(df)
 
 summary = create_summary(df)
+exceptions = df[df["Has Exception"]].copy()
+exception_summary = build_exception_summary(df)
 
 
 # ============================================================
@@ -843,6 +1139,32 @@ k8.metric("Potential Duplicates", f"{summary['Potential Duplicate Count']:,}")
 
 st.subheader("Automated Analysis and Conclusion")
 st.write(conclusion)
+
+
+# ============================================================
+# Exception Summary
+# ============================================================
+
+st.subheader("Exception Summary")
+
+if exception_summary.empty:
+    st.success("No exceptions were identified.")
+else:
+    c1, c2 = st.columns([1, 2])
+
+    with c1:
+        st.dataframe(exception_summary, use_container_width=True)
+
+    with c2:
+        fig = px.bar(
+            exception_summary,
+            x="Count",
+            y="Exception Type",
+            orientation="h",
+            title="Exception Counts by Type",
+        )
+        fig.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig, use_container_width=True)
 
 
 # ============================================================
@@ -946,9 +1268,7 @@ with tab5:
 # Exceptions and Data
 # ============================================================
 
-st.subheader("Exception Report")
-
-exceptions = df[df["Has Exception"]].copy()
+st.subheader("Detailed Exception Report")
 
 if exceptions.empty:
     st.success("No exceptions were identified using the current rules.")
@@ -978,9 +1298,9 @@ st.warning(
     "Exported Excel, Word, and PDF files may contain sensitive financial data."
 )
 
-excel_bytes = export_excel(df, summary, conclusion)
-word_bytes = export_word(summary, conclusion, exceptions)
-pdf_bytes = export_pdf(summary, conclusion, exceptions)
+excel_bytes = export_excel(df, summary, conclusion, exception_summary)
+word_bytes = export_word(summary, conclusion, exceptions, exception_summary)
+pdf_bytes = export_pdf(summary, conclusion, exceptions, exception_summary)
 
 c1, c2, c3 = st.columns(3)
 
